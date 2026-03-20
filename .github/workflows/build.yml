@@ -1,0 +1,89 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows
+            ext: .exe
+          - os: macos-latest
+            target: macos
+            ext: .app
+          - os: ubuntu-latest
+            target: linux
+            ext: ''
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build Windows
+        if: matrix.target == 'windows'
+        run: |
+          pyinstaller --windowed --onefile --name "图像批量生成" main.py
+
+      - name: Build macOS
+        if: matrix.target == 'macos'
+        run: |
+          pyinstaller --windowed --onedir --name "图像批量生成" main.py
+
+      - name: Build Linux
+        if: matrix.target == 'linux'
+        run: |
+          pyinstaller --windowed --onefile --name "图像批量生成" main.py
+
+      - name: Create ZIP (macOS)
+        if: matrix.target == 'macos'
+        run: |
+          cd dist
+          zip -r "../图像批量生成-macos.zip" "图像批量生成.app"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-build
+          path: |
+            dist/图像批量生成${{ matrix.ext }}
+            dist/图像批量生成-*.zip
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/windows-build/图像批量生成.exe
+            artifacts/macos-build/图像批量生成-macos.zip
+            artifacts/linux-build/图像批量生成
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
