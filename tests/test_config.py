@@ -19,15 +19,18 @@ class ConfigTests(unittest.TestCase):
             ],
             generation_settings=GenerationSettings(
                 prompt="hello",
+                prompt_mode="file",
+                prompt_file_path="D:/prompt.txt",
                 model_type="gemini-test",
                 temperature=0.9,
                 top_p=0.7,
-                aspect_ratio="1:1",
-                timeout=180,
-                variants_per_group=3,
-                seed_enabled=True,
-                base_seed=99,
-            ),
+            aspect_ratio="1:1",
+            image_size="4K",
+            timeout=180,
+            variants_per_group=3,
+            seed_enabled=True,
+            base_seed=99,
+        ),
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -42,9 +45,27 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(loaded.folder_slots[0].name, "饰品")
         self.assertFalse(loaded.folder_slots[1].enabled)
         self.assertEqual(loaded.generation_settings.prompt, "hello")
+        self.assertEqual(loaded.generation_settings.prompt_mode, "file")
+        self.assertEqual(loaded.generation_settings.prompt_file_path, "D:/prompt.txt")
         self.assertEqual(loaded.generation_settings.variants_per_group, 3)
         self.assertTrue(loaded.generation_settings.seed_enabled)
         self.assertEqual(loaded.generation_settings.base_seed, 99)
+        self.assertEqual(loaded.generation_settings.image_size, "4K")
+
+    def test_generation_settings_defaults_image_size_for_legacy_config(self) -> None:
+        settings = GenerationSettings.from_dict(
+            {
+                "prompt": "legacy",
+                "model_type": "gemini-test",
+                "temperature": 0.8,
+                "top_p": 0.65,
+                "aspect_ratio": "Auto",
+            }
+        )
+
+        self.assertEqual(settings.image_size, "2K")
+        self.assertEqual(settings.prompt_mode, "fixed")
+        self.assertEqual(settings.prompt_file_path, "")
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QStackedWidget,
     QSizePolicy,
     QSpinBox,
     QDoubleSpinBox,
@@ -38,10 +39,16 @@ from PySide6.QtWidgets import (
 from GeminiImage import (
     BatchTask,
     GeminiImageGenerator,
+    build_image_name_map,
     build_batch_tasks,
     list_image_files,
+    parse_prompt_text_file,
+    sort_match_keys,
 )
 from config import AppConfig, ConfigManager, FolderSlot, GenerationSettings
+from license_bootstrap import authorize_before_launch as run_license_authorization
+from license_login_dialog import LicenseLoginDialog
+from license_service import LicenseManager
 
 WINDOW_TITLE = "NanoBanana Batch"
 
@@ -195,7 +202,8 @@ class BatchWorker(QObject):
                 break
 
             self.log_message.emit(
-                f"开始第 {task.group_index + 1}/{len(self.tasks)} 组，参考图 {len(task.reference_images)} 张。"
+                f"开始第 {task.group_index + 1}/{len(self.tasks)} 组 [{task.match_key}]，"
+                f"参考图 {len(task.reference_images)} 张。"
             )
 
             for variant_index in range(max(1, settings.variants_per_group)):
@@ -213,12 +221,13 @@ class BatchWorker(QObject):
 
                 result = generator.generate_single_image(
                     task=task,
-                    prompt=settings.prompt,
+                    prompt=task.prompt_text,
                     output_dir=self.config.output_dir,
                     variant_index=variant_index,
                     temperature=settings.temperature,
                     top_p=settings.top_p,
                     aspect_ratio=settings.aspect_ratio,
+                    image_size=settings.image_size,
                     timeout=settings.timeout,
                     seed=seed,
                 )
@@ -229,7 +238,7 @@ class BatchWorker(QObject):
                     success_count += 1
                     image_count = len(result.saved_paths)
                     self.log_message.emit(
-                        f"第 {task.group_index + 1} 组 / 变体 {variant_index + 1} 成功，"
+                        f"第 {task.group_index + 1} 组 [{task.match_key}] / 变体 {variant_index + 1} 成功，"
                         f"保存 {image_count} 张，耗时 {result.elapsed_seconds:.1f}s。"
                     )
                     if result.saved_paths:
@@ -237,7 +246,8 @@ class BatchWorker(QObject):
                 else:
                     failure_count += 1
                     self.log_message.emit(
-                        f"第 {task.group_index + 1} 组 / 变体 {variant_index + 1} 失败：{result.error}"
+                        f"第 {task.group_index + 1} 组 [{task.match_key}] / "
+                        f"变体 {variant_index + 1} 失败：{result.error}"
                     )
 
             if stopped:
@@ -300,6 +310,10 @@ class SettingsDialog(QDialog):
         self.aspect_ratio_combo.addItems(["Auto", "1:1", "3:4", "4:3", "9:16", "16:9"])
         self.aspect_ratio_combo.setCurrentText(generation_settings.aspect_ratio)
 
+        self.image_size_combo = QComboBox()
+        self.image_size_combo.addItems(["Auto", "1K", "2K", "4K"])
+        self.image_size_combo.setCurrentText(generation_settings.image_size)
+
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(30, 600)
         self.timeout_spin.setSingleStep(10)
@@ -324,6 +338,7 @@ class SettingsDialog(QDialog):
         form.addRow("Temperature", self.temperature_spin)
         form.addRow("Top P", self.top_p_spin)
         form.addRow("比例", self.aspect_ratio_combo)
+        form.addRow("分辨率", self.image_size_combo)
         form.addRow("超时", self.timeout_spin)
         form.addRow("每组生成数量", self.variants_spin)
         form.addRow(self.seed_enabled_check, self.base_seed_spin)
@@ -342,26 +357,28 @@ class SettingsDialog(QDialog):
         return (
             self.api_url_edit.text().strip(),
             self.api_key_edit.text().strip(),
-            GenerationSettings(
-                prompt="",
-                model_type=self.model_edit.text().strip(),
-                temperature=self.temperature_spin.value(),
-                top_p=self.top_p_spin.value(),
-                aspect_ratio=self.aspect_ratio_combo.currentText(),
-                timeout=self.timeout_spin.value(),
-                variants_per_group=self.variants_spin.value(),
-                seed_enabled=self.seed_enabled_check.isChecked(),
-                base_seed=self.base_seed_spin.value(),
-            ),
+        GenerationSettings(
+            prompt="",
+            model_type=self.model_edit.text().strip(),
+            temperature=self.temperature_spin.value(),
+            top_p=self.top_p_spin.value(),
+            aspect_ratio=self.aspect_ratio_combo.currentText(),
+            image_size=self.image_size_combo.currentText(),
+            timeout=self.timeout_spin.value(),
+            variants_per_group=self.variants_spin.value(),
+            seed_enabled=self.seed_enabled_check.isChecked(),
+            base_seed=self.base_seed_spin.value(),
+        ),
         )
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, license_manager: LicenseManager | None = None) -> None:
         super().__init__()
         self.setWindowTitle(WINDOW_TITLE)
-        self.resize(1000, 800)
+        self.resize(1200, 800)
 
+        self.license_manager = license_manager
         self.thread: QThread | None = None
         self.worker: BatchWorker | None = None
         self.slot_widgets: list[FolderSlotWidget] = []
@@ -382,7 +399,7 @@ class MainWindow(QMainWindow):
 
         title_label = QLabel("NanoBanana Batch")
         title_label.setObjectName("titleLabel")
-        subtitle_label = QLabel("按参考槽位顺序批量组图，调用 API 生成并保存结果。")
+        subtitle_label = QLabel("按文件名匹配参考槽位，批量组图并调用 API 生成结果。")
         subtitle_label.setObjectName("mutedLabel")
 
         root_layout.addWidget(title_label)
@@ -408,7 +425,7 @@ class MainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         self.add_slot_button = QPushButton("新增槽位")
         self.add_slot_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.task_summary_label = QLabel("已启用 0 个槽位，可执行 0 组")
+        self.task_summary_label = QLabel("已启用 0 个槽位，完全匹配后可执行 0 组")
         self.task_summary_label.setObjectName("summaryLabel")
         toolbar.addWidget(self.add_slot_button)
         toolbar.addStretch(1)
@@ -449,6 +466,32 @@ class MainWindow(QMainWindow):
         self.prompt_edit.setPlaceholderText("输入统一的提示词")
         self.prompt_edit.setFixedHeight(110)
 
+        self.prompt_mode_combo = QComboBox()
+        self.prompt_mode_combo.addItem("固定提示词", "fixed")
+        self.prompt_mode_combo.addItem("提示词文本", "file")
+
+        self.prompt_file_edit = QLineEdit()
+        self.prompt_file_edit.setPlaceholderText("选择提示词文本，例如 test.txt")
+        prompt_file_row, self.prompt_file_button = create_line_button_row(
+            self.prompt_file_edit,
+            "选择文件",
+        )
+
+        prompt_file_hint = QLabel("格式：文件名=提示词；支持空行和 # 注释。")
+        prompt_file_hint.setObjectName("mutedLabel")
+        prompt_file_hint.setWordWrap(True)
+
+        prompt_file_page = QWidget()
+        prompt_file_layout = QVBoxLayout(prompt_file_page)
+        prompt_file_layout.setContentsMargins(0, 0, 0, 0)
+        prompt_file_layout.setSpacing(8)
+        prompt_file_layout.addWidget(prompt_file_row)
+        prompt_file_layout.addWidget(prompt_file_hint)
+
+        self.prompt_input_stack = QStackedWidget()
+        self.prompt_input_stack.addWidget(self.prompt_edit)
+        self.prompt_input_stack.addWidget(prompt_file_page)
+
         self.output_dir_edit = QLineEdit()
         self.output_dir_edit.setPlaceholderText("选择输出目录")
         output_row, self.output_dir_button = create_line_button_row(
@@ -458,10 +501,21 @@ class MainWindow(QMainWindow):
 
         basic_form.addRow("URL", self.api_url_edit)
         basic_form.addRow("API Key", self.api_key_edit)
-        basic_form.addRow("Prompt", self.prompt_edit)
+        basic_form.addRow("Prompt 模式", self.prompt_mode_combo)
+        basic_form.addRow("Prompt", self.prompt_input_stack)
         basic_form.addRow("输出目录", output_row)
 
         self.output_dir_button.clicked.connect(self.choose_output_directory)
+        self.prompt_file_button.clicked.connect(self.choose_prompt_file)
+        self.prompt_mode_combo.currentIndexChanged.connect(self.update_prompt_mode_ui)
+        self.prompt_edit.textChanged.connect(self.update_task_summary)
+        self.prompt_file_edit.textChanged.connect(self.update_task_summary)
+        self.api_url_edit.textChanged.connect(self.update_settings_summary)
+        self.api_key_edit.textChanged.connect(self.update_settings_summary)
+        self.prompt_mode_combo.currentIndexChanged.connect(self.update_settings_summary)
+        self.prompt_edit.textChanged.connect(self.update_settings_summary)
+        self.prompt_file_edit.textChanged.connect(self.update_settings_summary)
+        self.update_prompt_mode_ui()
         return group
 
     def _build_advanced_settings_group(self) -> QGroupBox:
@@ -650,6 +704,34 @@ class MainWindow(QMainWindow):
         if directory:
             self.output_dir_edit.setText(directory)
 
+    def choose_prompt_file(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择提示词文本",
+            self.prompt_file_edit.text().strip() or str(Path.home()),
+            "文本文件 (*.txt);;所有文件 (*)",
+        )
+        if file_path:
+            self.prompt_file_edit.setText(file_path)
+
+    def current_prompt_mode(self) -> str:
+        prompt_mode = self.prompt_mode_combo.currentData()
+        return prompt_mode if prompt_mode in {"fixed", "file"} else "fixed"
+
+    def set_prompt_mode(self, prompt_mode: str) -> None:
+        target_mode = prompt_mode if prompt_mode in {"fixed", "file"} else "fixed"
+        index = self.prompt_mode_combo.findData(target_mode)
+        if index < 0:
+            index = 0
+        self.prompt_mode_combo.setCurrentIndex(index)
+        self.update_prompt_mode_ui()
+
+    def update_prompt_mode_ui(self) -> None:
+        self.prompt_input_stack.setCurrentIndex(
+            1 if self.current_prompt_mode() == "file" else 0
+        )
+        self.update_task_summary()
+
     def load_config(self) -> None:
         config = ConfigManager.load()
 
@@ -659,6 +741,8 @@ class MainWindow(QMainWindow):
 
         self.generation_settings = config.generation_settings
         self.prompt_edit.setPlainText(self.generation_settings.prompt)
+        self.prompt_file_edit.setText(self.generation_settings.prompt_file_path)
+        self.set_prompt_mode(self.generation_settings.prompt_mode)
 
         self.slot_widgets = []
         while self.slot_layout.count() > 1:
@@ -677,10 +761,13 @@ class MainWindow(QMainWindow):
     def collect_config(self) -> AppConfig:
         settings = GenerationSettings(
             prompt=self.prompt_edit.toPlainText().strip(),
+            prompt_mode=self.current_prompt_mode(),
+            prompt_file_path=self.prompt_file_edit.text().strip(),
             model_type=self.generation_settings.model_type,
             temperature=self.generation_settings.temperature,
             top_p=self.generation_settings.top_p,
             aspect_ratio=self.generation_settings.aspect_ratio,
+            image_size=self.generation_settings.image_size,
             timeout=self.generation_settings.timeout,
             variants_per_group=self.generation_settings.variants_per_group,
             seed_enabled=self.generation_settings.seed_enabled,
@@ -705,20 +792,29 @@ class MainWindow(QMainWindow):
             else:
                 masked_key = f"{api_key[:4]}...{api_key[-4:]}"
 
-        settings = self.generation_settings
+        settings = self.collect_config().generation_settings
+        prompt_mode_text = "提示词文本" if settings.prompt_mode == "file" else "固定提示词"
+        if settings.prompt_mode == "file":
+            prompt_source = settings.prompt_file_path or "未选择"
+        else:
+            prompt_source = f"{len(settings.prompt)} 字符" if settings.prompt else "未填写"
         self.settings_summary_label.setText(
             "URL：{url}\n"
             "API Key：{key}\n"
             "模型：{model}\n"
+            "Prompt：{prompt_mode}   来源：{prompt_source}\n"
             "Temperature：{temperature:.2f}   Top P：{top_p:.2f}\n"
-            "比例：{ratio}   超时：{timeout} 秒   每组：{variants} 次\n"
+            "比例：{ratio}   分辨率：{image_size}   超时：{timeout} 秒   每组：{variants} 次\n"
             "Seed：{seed}".format(
                 url=api_base_url or "未配置",
                 key=masked_key,
                 model=settings.model_type or "未配置",
+                prompt_mode=prompt_mode_text,
+                prompt_source=prompt_source,
                 temperature=settings.temperature,
                 top_p=settings.top_p,
                 ratio=settings.aspect_ratio,
+                image_size=settings.image_size,
                 timeout=settings.timeout,
                 variants=settings.variants_per_group,
                 seed=str(settings.base_seed) if settings.seed_enabled else "随机",
@@ -737,25 +833,74 @@ class MainWindow(QMainWindow):
 
         api_base_url, api_key, generation_settings = dialog.get_values()
         generation_settings.prompt = self.prompt_edit.toPlainText().strip()
+        generation_settings.prompt_mode = self.current_prompt_mode()
+        generation_settings.prompt_file_path = self.prompt_file_edit.text().strip()
         self.api_url_edit.setText(api_base_url)
         self.api_key_edit.setText(api_key)
         self.generation_settings = generation_settings
         self.update_settings_summary()
+        self.update_task_summary()
 
     def update_task_summary(self) -> None:
-        enabled_counts: list[int] = []
+        enabled_slot_sources: list[tuple[str, dict[str, str]]] = []
         enabled_slots = 0
+        invalid_slot_found = False
         for widget in self.slot_widgets:
             slot = widget.to_slot()
-            count = widget.refresh_count()
-            if slot.enabled and slot.path:
-                enabled_slots += 1
-                enabled_counts.append(count)
+            widget.refresh_count()
+            if not slot.enabled:
+                continue
 
-        executable_groups = min(enabled_counts) if enabled_counts else 0
-        self.task_summary_label.setText(
-            f"已启用 {enabled_slots} 个槽位，可执行 {executable_groups} 组"
-        )
+            enabled_slots += 1
+            if not slot.path:
+                invalid_slot_found = True
+                continue
+
+            folder_path = Path(slot.path)
+            if not folder_path.exists() or not folder_path.is_dir():
+                invalid_slot_found = True
+                continue
+
+            image_files = list_image_files(folder_path)
+            if not image_files:
+                invalid_slot_found = True
+                continue
+
+            image_map, duplicate_errors = build_image_name_map(image_files)
+            if duplicate_errors or not image_map:
+                invalid_slot_found = True
+                continue
+
+            enabled_slot_sources.append((slot.name, image_map))
+
+        if enabled_slots == 0:
+            self.task_summary_label.setText("已启用 0 个槽位，完全匹配后可执行 0 组")
+            return
+
+        if invalid_slot_found or len(enabled_slot_sources) != enabled_slots:
+            summary_text = f"已启用 {enabled_slots} 个槽位，可执行 0 组"
+        else:
+            all_keys = set().union(*(image_map.keys() for _, image_map in enabled_slot_sources))
+            aligned = all(set(image_map) == all_keys for _, image_map in enabled_slot_sources)
+            if not aligned:
+                summary_text = f"已启用 {enabled_slots} 个槽位，文件名未对齐"
+            else:
+                summary_text = (
+                    f"已启用 {enabled_slots} 个槽位，完全匹配后可执行 {len(all_keys)} 组"
+                )
+
+            if self.current_prompt_mode() == "file":
+                prompt_path = self.prompt_file_edit.text().strip()
+                prompt_valid = False
+                if prompt_path:
+                    prompt_file = Path(prompt_path)
+                    if prompt_file.exists() and prompt_file.is_file():
+                        prompt_map, format_errors = parse_prompt_text_file(prompt_file)
+                        prompt_valid = not format_errors and set(prompt_map) == all_keys
+                if not prompt_valid:
+                    summary_text = f"{summary_text}，提示词文本待修正"
+
+        self.task_summary_label.setText(summary_text)
 
     def save_config(self) -> None:
         try:
@@ -770,37 +915,130 @@ class MainWindow(QMainWindow):
     def validate_and_build_tasks(self) -> tuple[AppConfig, list[BatchTask]]:
         config_data = self.collect_config()
         settings = config_data.generation_settings
+        base_errors: list[str] = []
+        slot_errors: list[str] = []
+        prompt_file_errors: list[str] = []
+        format_errors: list[str] = []
 
         if not config_data.api_base_url:
-            raise ValueError("请填写 API URL。")
+            base_errors.append("请填写 API URL。")
         if not config_data.api_key:
-            raise ValueError("请填写 API Key。")
-        if not settings.prompt:
-            raise ValueError("请填写 Prompt。")
+            base_errors.append("请填写 API Key。")
         if not config_data.output_dir:
-            raise ValueError("请选择输出目录。")
+            base_errors.append("请选择输出目录。")
 
-        enabled_slot_sources: list[tuple[str, list[str]]] = []
+        prompt_map: dict[str, str] | None = None
+        if settings.prompt_mode == "file":
+            prompt_file_path = settings.prompt_file_path.strip()
+            if not prompt_file_path:
+                prompt_file_errors.append("请选择提示词文本文件。")
+            else:
+                prompt_path = Path(prompt_file_path)
+                if not prompt_path.exists():
+                    prompt_file_errors.append(
+                        f"提示词文本不存在：{settings.prompt_file_path}"
+                    )
+                elif not prompt_path.is_file():
+                    prompt_file_errors.append(
+                        f"提示词文本不是有效文件：{settings.prompt_file_path}"
+                    )
+                else:
+                    prompt_map, parse_errors = parse_prompt_text_file(prompt_path)
+                    format_errors.extend(
+                        [f"提示词文件第 {error[2:]}" if error.startswith("第 ") else error for error in parse_errors]
+                    )
+        elif not settings.prompt:
+            base_errors.append("请填写固定 Prompt。")
+
+        enabled_slot_count = 0
+        enabled_slot_sources: list[tuple[str, dict[str, str]]] = []
         for slot in config_data.folder_slots:
             if not slot.enabled:
                 continue
+
+            enabled_slot_count += 1
             if not slot.path:
-                raise ValueError(f"槽位“{slot.name}”未选择文件夹。")
+                slot_errors.append(f"槽位“{slot.name}”未选择文件夹。")
+                continue
 
             folder_path = Path(slot.path)
             if not folder_path.exists() or not folder_path.is_dir():
-                raise ValueError(f"槽位“{slot.name}”的目录不存在。")
+                slot_errors.append(f"槽位“{slot.name}”的目录不存在。")
+                continue
 
             image_files = list_image_files(folder_path)
             if not image_files:
-                raise ValueError(f"槽位“{slot.name}”目录中没有可用图片。")
+                slot_errors.append(f"槽位“{slot.name}”目录中没有可用图片。")
+                continue
 
-            enabled_slot_sources.append((slot.name, image_files))
+            image_map, duplicate_errors = build_image_name_map(image_files)
+            if duplicate_errors:
+                slot_errors.extend(
+                    [f"槽位“{slot.name}”：{error}" for error in duplicate_errors]
+                )
+                continue
 
-        if not enabled_slot_sources:
-            raise ValueError("至少启用一个有效的参考槽位。")
+            enabled_slot_sources.append((slot.name, image_map))
 
-        tasks = build_batch_tasks(enabled_slot_sources)
+        if enabled_slot_count == 0:
+            slot_errors.append("至少启用一个有效的参考槽位。")
+
+        expected_keys: list[str] = []
+        if enabled_slot_sources:
+            all_keys = set().union(
+                *(set(image_map.keys()) for _, image_map in enabled_slot_sources)
+            )
+            common_keys = set(all_keys)
+            for _, image_map in enabled_slot_sources:
+                common_keys &= set(image_map.keys())
+
+            expected_keys = sort_match_keys(list(all_keys))
+            for slot_name, image_map in enabled_slot_sources:
+                slot_keys = set(image_map.keys())
+                missing_keys = sort_match_keys(list(all_keys - slot_keys))
+                extra_keys = sort_match_keys(list(slot_keys - common_keys))
+                if missing_keys:
+                    slot_errors.append(
+                        f"槽位“{slot_name}”缺少文件名：{', '.join(missing_keys)}"
+                    )
+                if extra_keys:
+                    slot_errors.append(
+                        f"槽位“{slot_name}”多出文件名：{', '.join(extra_keys)}"
+                    )
+
+        if prompt_map is not None and expected_keys:
+            prompt_keys = set(prompt_map.keys())
+            expected_key_set = set(expected_keys)
+            missing_prompts = sort_match_keys(list(expected_key_set - prompt_keys))
+            extra_prompts = sort_match_keys(list(prompt_keys - expected_key_set))
+            if missing_prompts:
+                prompt_file_errors.append(
+                    f"提示词文本缺少文件名：{', '.join(missing_prompts)}"
+                )
+            if extra_prompts:
+                prompt_file_errors.append(
+                    f"提示词文本多出文件名：{', '.join(extra_prompts)}"
+                )
+
+        sections: list[str] = []
+        if base_errors:
+            sections.append("基础配置问题：\n" + "\n".join(f"- {error}" for error in base_errors))
+        if slot_errors:
+            sections.append("槽位目录问题：\n" + "\n".join(f"- {error}" for error in slot_errors))
+        if prompt_file_errors:
+            sections.append(
+                "提示词文件问题：\n" + "\n".join(f"- {error}" for error in prompt_file_errors)
+            )
+        if format_errors:
+            sections.append("格式问题：\n" + "\n".join(f"- {error}" for error in format_errors))
+        if sections:
+            raise ValueError("\n\n".join(sections))
+
+        tasks = build_batch_tasks(
+            enabled_slot_sources,
+            fixed_prompt=settings.prompt,
+            prompt_map=prompt_map,
+        )
         if not tasks:
             raise ValueError("当前配置无法组成任何批处理任务。")
 
@@ -820,7 +1058,10 @@ class MainWindow(QMainWindow):
             self.api_key_edit,
             self.output_dir_edit,
             self.output_dir_button,
+            self.prompt_mode_combo,
             self.prompt_edit,
+            self.prompt_file_edit,
+            self.prompt_file_button,
             self.settings_button,
         ):
             control.setEnabled(not running)
@@ -940,19 +1181,22 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
-    EXPIRE_DATE = datetime(2026, 3, 23)
-    if datetime.now() > EXPIRE_DATE:
-        app = QApplication(sys.argv)
-        QMessageBox.critical(
-            None, "软件已过期", "软件已于 2026年3月23日 过期，请联系开发者获取新版本。"
-        )
-        return 1
-
     app = QApplication(sys.argv)
+    startup_exit_code, license_manager = authorize_before_launch()
+    if startup_exit_code is not None:
+        return startup_exit_code
 
-    window = MainWindow()
+    window = MainWindow(license_manager=license_manager)
     window.show()
     return app.exec()
+
+
+def authorize_before_launch() -> tuple[int | None, LicenseManager | None]:
+    return run_license_authorization(
+        dialog_factory=LicenseLoginDialog,
+        show_error=lambda message: QMessageBox.critical(None, "启动失败", message),
+        accepted_code=int(QDialog.DialogCode.Accepted),
+    )
 
 
 if __name__ == "__main__":

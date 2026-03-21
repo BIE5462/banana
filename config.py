@@ -47,10 +47,13 @@ class FolderSlot:
 @dataclass
 class GenerationSettings:
     prompt: str = ""
+    prompt_mode: str = "fixed"
+    prompt_file_path: str = ""
     model_type: str = DEFAULT_MODEL_TYPE
     temperature: float = 0.8
     top_p: float = 0.65
     aspect_ratio: str = "Auto"
+    image_size: str = "2K"
     timeout: int = DEFAULT_TIMEOUT
     variants_per_group: int = 1
     seed_enabled: bool = False
@@ -58,12 +61,18 @@ class GenerationSettings:
 
     @classmethod
     def from_dict(cls, data: dict) -> "GenerationSettings":
+        prompt_mode = str(data.get("prompt_mode", "fixed"))
+        if prompt_mode not in {"fixed", "file"}:
+            prompt_mode = "fixed"
         return cls(
             prompt=str(data.get("prompt", "")),
+            prompt_mode=prompt_mode,
+            prompt_file_path=str(data.get("prompt_file_path", "")),
             model_type=str(data.get("model_type", DEFAULT_MODEL_TYPE)),
             temperature=float(data.get("temperature", 0.8)),
             top_p=float(data.get("top_p", 0.65)),
             aspect_ratio=str(data.get("aspect_ratio", "Auto")),
+            image_size=str(data.get("image_size", "2K")),
             timeout=int(data.get("timeout", DEFAULT_TIMEOUT)),
             variants_per_group=max(1, int(data.get("variants_per_group", 1))),
             seed_enabled=bool(data.get("seed_enabled", False)),
@@ -73,10 +82,13 @@ class GenerationSettings:
     def to_dict(self) -> dict:
         return {
             "prompt": self.prompt,
+            "prompt_mode": self.prompt_mode,
+            "prompt_file_path": self.prompt_file_path,
             "model_type": self.model_type,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "aspect_ratio": self.aspect_ratio,
+            "image_size": self.image_size,
             "timeout": self.timeout,
             "variants_per_group": self.variants_per_group,
             "seed_enabled": self.seed_enabled,

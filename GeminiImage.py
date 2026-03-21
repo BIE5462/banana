@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import requests
 from PIL import Image
@@ -22,6 +22,8 @@ DEFAULT_TIMEOUT = 240
 @dataclass
 class BatchTask:
     group_index: int
+    match_key: str
+    prompt_text: str
     reference_images: list[str]
     slot_names: list[str] = field(default_factory=list)
 
@@ -57,21 +59,95 @@ def list_image_files(folder_path: str | Path) -> list[str]:
     return [str(item) for item in sorted(image_files, key=lambda item: item.name.lower())]
 
 
-def build_batch_tasks(slot_image_pairs: Sequence[tuple[str, Sequence[str]]]) -> list[BatchTask]:
+def normalize_match_key(value: str | Path) -> str:
+    text = str(value).strip()
+    if not text:
+        return ""
+    return Path(text).stem.strip()
+
+
+def sort_match_keys(keys: Sequence[str]) -> list[str]:
+    return sorted(keys, key=lambda item: (item.lower(), item))
+
+
+def build_image_name_map(image_paths: Sequence[str]) -> tuple[dict[str, str], list[str]]:
+    image_map: dict[str, str] = {}
+    errors: list[str] = []
+    for image_path in image_paths:
+        path = Path(image_path)
+        match_key = normalize_match_key(path.name)
+        if not match_key:
+            errors.append(f"文件“{path.name}”没有可用的主文件名。")
+            continue
+
+        existing_path = image_map.get(match_key)
+        if existing_path is not None:
+            errors.append(
+                f"主文件名“{match_key}”重复：{Path(existing_path).name}、{path.name}"
+            )
+            continue
+
+        image_map[match_key] = str(path)
+    return image_map, errors
+
+
+def parse_prompt_text_file(prompt_file_path: str | Path) -> tuple[dict[str, str], list[str]]:
+    path = Path(prompt_file_path)
+    try:
+        raw_text = path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        return {}, [f"无法读取提示词文件：{exc}"]
+
+    prompt_map: dict[str, str] = {}
+    errors: list[str] = []
+    for line_number, raw_line in enumerate(raw_text.splitlines(), start=1):
+        stripped_line = raw_line.strip()
+        if not stripped_line or stripped_line.startswith("#"):
+            continue
+
+        if "=" not in raw_line:
+            errors.append(f"第 {line_number} 行缺少“=”分隔符。")
+            continue
+
+        raw_name, raw_prompt = raw_line.split("=", 1)
+        match_key = normalize_match_key(raw_name)
+        prompt_text = raw_prompt.strip()
+        if not match_key:
+            errors.append(f"第 {line_number} 行文件名为空。")
+            continue
+        if not prompt_text:
+            errors.append(f"第 {line_number} 行提示词为空。")
+            continue
+        if match_key in prompt_map:
+            errors.append(f"第 {line_number} 行文件名“{match_key}”重复。")
+            continue
+
+        prompt_map[match_key] = prompt_text
+    return prompt_map, errors
+
+
+def build_batch_tasks(
+    slot_image_pairs: Sequence[tuple[str, Mapping[str, str]]],
+    *,
+    fixed_prompt: str = "",
+    prompt_map: Mapping[str, str] | None = None,
+) -> list[BatchTask]:
     if not slot_image_pairs:
         return []
 
-    total_groups = min(len(images) for _, images in slot_image_pairs)
-    if total_groups <= 0:
+    match_keys = sort_match_keys(list(slot_image_pairs[0][1].keys()))
+    if not match_keys:
         return []
 
     slot_names = [name for name, _ in slot_image_pairs]
     tasks: list[BatchTask] = []
-    for group_index in range(total_groups):
-        reference_images = [str(images[group_index]) for _, images in slot_image_pairs]
+    for group_index, match_key in enumerate(match_keys):
+        reference_images = [str(image_map[match_key]) for _, image_map in slot_image_pairs]
         tasks.append(
             BatchTask(
                 group_index=group_index,
+                match_key=match_key,
+                prompt_text=prompt_map[match_key] if prompt_map is not None else fixed_prompt,
                 reference_images=reference_images,
                 slot_names=slot_names,
             )
@@ -144,6 +220,7 @@ class GeminiImageGenerator:
         prompt: str,
         seed: int | None,
         aspect_ratio: str,
+        image_size: str = "2K",
         temperature: float = 0.8,
         top_p: float = 0.65,
         image_paths: Sequence[str] | None = None,
@@ -179,8 +256,17 @@ class GeminiImageGenerator:
             "maxOutputTokens": 8192,
         }
 
+        image_config: dict[str, str] = {}
         if aspect_ratio and aspect_ratio != "Auto":
-            generation_config["imageConfig"] = {"aspectRatio": aspect_ratio}
+            image_config["aspectRatio"] = aspect_ratio
+        elif image_size and image_size != "Auto":
+            image_config["aspectRatio"] = "1:1"
+
+        if image_size and image_size != "Auto":
+            image_config["imageSize"] = image_size
+
+        if image_config:
+            generation_config["imageConfig"] = image_config
 
         if seed != -1:
             generation_config["seed"] = seed
@@ -271,11 +357,12 @@ class GeminiImageGenerator:
         task: BatchTask,
         prompt: str,
         output_dir: str | Path,
-        variant_index: int = 0,
-        temperature: float = 0.8,
-        top_p: float = 0.65,
-        aspect_ratio: str = "Auto",
-        timeout: int = DEFAULT_TIMEOUT,
+    variant_index: int = 0,
+    temperature: float = 0.8,
+    top_p: float = 0.65,
+    aspect_ratio: str = "Auto",
+    image_size: str = "2K",
+    timeout: int = DEFAULT_TIMEOUT,
         seed: int | None = None,
     ) -> TaskResult:
         """执行单次图像生成。"""
@@ -286,6 +373,7 @@ class GeminiImageGenerator:
                 prompt=prompt,
                 seed=seed,
                 aspect_ratio=aspect_ratio,
+                image_size=image_size,
                 temperature=temperature,
                 top_p=top_p,
                 image_paths=task.reference_images,
@@ -356,18 +444,19 @@ class GeminiImageGenerator:
                 seed=seed,
             )
 
-    def generate_images(
-        self,
-        prompt: str,
-        image_paths: Sequence[str] | None = None,
-        variants_per_group: int = 1,
-        seed_enabled: bool = False,
-        base_seed: int = 1,
-        aspect_ratio: str = "Auto",
-        temperature: float = 0.8,
-        top_p: float = 0.65,
-        output_dir: str | Path = "output",
-        timeout: int = DEFAULT_TIMEOUT,
+def generate_images(
+    self,
+    prompt: str,
+    image_paths: Sequence[str] | None = None,
+    variants_per_group: int = 1,
+    seed_enabled: bool = False,
+    base_seed: int = 1,
+    aspect_ratio: str = "Auto",
+    image_size: str = "2K",
+    temperature: float = 0.8,
+    top_p: float = 0.65,
+    output_dir: str | Path = "output",
+    timeout: int = DEFAULT_TIMEOUT,
         group_index: int = 0,
         slot_names: Sequence[str] | None = None,
     ) -> list[TaskResult]:
@@ -377,6 +466,8 @@ class GeminiImageGenerator:
 
         task = BatchTask(
             group_index=group_index,
+            match_key=normalize_match_key(Path(image_paths[0]).name) if image_paths else f"group_{group_index + 1}",
+            prompt_text=prompt,
             reference_images=list(image_paths or []),
             slot_names=list(slot_names or []),
         )
@@ -391,14 +482,15 @@ class GeminiImageGenerator:
                 self.generate_single_image(
                     task=task,
                     prompt=prompt,
-                    output_dir=output_dir,
-                    variant_index=variant_index,
-                    temperature=temperature,
-                    top_p=top_p,
-                    aspect_ratio=aspect_ratio,
-                    timeout=timeout,
-                    seed=seed,
-                )
+                output_dir=output_dir,
+                variant_index=variant_index,
+                temperature=temperature,
+                top_p=top_p,
+                aspect_ratio=aspect_ratio,
+                image_size=image_size,
+                timeout=timeout,
+                seed=seed,
             )
+        )
 
         return results
