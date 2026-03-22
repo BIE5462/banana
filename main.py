@@ -45,6 +45,14 @@ from GeminiImage import (
     parse_prompt_text_file,
     sort_match_keys,
 )
+from api_usage_service import (
+    ApiUsageError,
+    ApiUsageSnapshot,
+    fetch_token_usage,
+    format_expires_at,
+    format_fetched_at,
+    format_model_limits,
+)
 from config import AppConfig, ConfigManager, FolderSlot, GenerationSettings
 from license_bootstrap import authorize_before_launch as run_license_authorization
 from license_login_dialog import LicenseLoginDialog
@@ -65,6 +73,12 @@ def create_line_button_row(
     button.setCursor(Qt.CursorShape.PointingHandCursor)
     layout.addWidget(button)
     return container, button
+
+
+def format_quota_value(value: float) -> str:
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:.2f}"
 
 
 class FolderSlotWidget(QFrame):
@@ -264,32 +278,56 @@ class BatchWorker(QObject):
         self.finished.emit(summary)
 
 
+class ApiUsageWorker(QObject):
+    usage_loaded = Signal(object)
+    usage_failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, base_url: str, api_key: str, timeout: int = 10) -> None:
+        super().__init__()
+        self.base_url = base_url
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def run(self) -> None:
+        try:
+            snapshot = fetch_token_usage(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                timeout=self.timeout,
+            )
+        except ApiUsageError as exc:
+            self.usage_failed.emit(str(exc))
+        except Exception as exc:
+            self.usage_failed.emit(f"额度查询失败：{exc}")
+        else:
+            self.usage_loaded.emit(snapshot)
+        finally:
+            self.finished.emit()
+
+
 class SettingsDialog(QDialog):
     def __init__(
         self,
         api_base_url: str,
         api_key: str,
         generation_settings: GenerationSettings,
+        usage_snapshot: ApiUsageSnapshot | None = None,
+        usage_error: str = "",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("高级设置")
         self.setModal(True)
-        self.resize(520, 420)
+        self.resize(540, 620)
+
+        self._api_base_url = api_base_url
+        self._api_key = api_key
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         form.setSpacing(10)
-
-        self.api_url_edit = QLineEdit(api_base_url)
-        self.api_url_edit.setPlaceholderText(
-            "https://generativelanguage.googleapis.com"
-        )
-
-        self.api_key_edit = QLineEdit(api_key)
-        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key_edit.setPlaceholderText("输入 API Key")
 
         self.model_edit = QLineEdit(generation_settings.model_type)
         self.model_edit.setPlaceholderText("gemini-2.5-flash-image")
@@ -332,8 +370,6 @@ class SettingsDialog(QDialog):
         self.base_seed_spin.setRange(0, 2_147_483_647)
         self.base_seed_spin.setValue(generation_settings.base_seed)
 
-        form.addRow("URL", self.api_url_edit)
-        form.addRow("API Key", self.api_key_edit)
         form.addRow("模型", self.model_edit)
         form.addRow("Temperature", self.temperature_spin)
         form.addRow("Top P", self.top_p_spin)
@@ -350,13 +386,95 @@ class SettingsDialog(QDialog):
         button_box.rejected.connect(self.reject)
 
         layout.addLayout(form)
+        layout.addWidget(self._build_usage_details_group(usage_snapshot, usage_error))
         layout.addStretch(1)
         layout.addWidget(button_box)
 
+    def _build_usage_details_group(
+        self,
+        usage_snapshot: ApiUsageSnapshot | None,
+        usage_error: str,
+    ) -> QGroupBox:
+        group = QGroupBox("额度详情")
+        detail_layout = QFormLayout(group)
+        detail_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        detail_layout.setSpacing(10)
+
+        self.usage_name_value = QLabel()
+        self.usage_available_value = QLabel()
+        self.usage_granted_value = QLabel()
+        self.usage_used_value = QLabel()
+        self.usage_remaining_value = QLabel()
+        self.usage_unlimited_value = QLabel()
+        self.usage_expire_value = QLabel()
+        self.usage_limits_enabled_value = QLabel()
+        self.usage_error_value = QLabel()
+        self.usage_error_value.setWordWrap(True)
+        self.usage_error_value.setObjectName("mutedLabel")
+
+        self.usage_model_limits_edit = QPlainTextEdit()
+        self.usage_model_limits_edit.setReadOnly(True)
+        self.usage_model_limits_edit.setFixedHeight(100)
+        self.usage_model_limits_edit.setPlaceholderText("未提供模型限制")
+
+        detail_layout.addRow("Token 名称", self.usage_name_value)
+        detail_layout.addRow("总可用", self.usage_available_value)
+        detail_layout.addRow("总授予", self.usage_granted_value)
+        detail_layout.addRow("已使用", self.usage_used_value)
+        detail_layout.addRow("剩余", self.usage_remaining_value)
+        detail_layout.addRow("无限额度", self.usage_unlimited_value)
+        detail_layout.addRow("过期时间", self.usage_expire_value)
+        detail_layout.addRow("模型限制", self.usage_limits_enabled_value)
+        detail_layout.addRow("模型明细", self.usage_model_limits_edit)
+        detail_layout.addRow("状态", self.usage_error_value)
+
+        self._render_usage_details(usage_snapshot, usage_error)
+        return group
+
+    def _render_usage_details(
+        self,
+        usage_snapshot: ApiUsageSnapshot | None,
+        usage_error: str,
+    ) -> None:
+        if usage_snapshot is None:
+            fallback_text = "请先在主界面刷新额度"
+            self.usage_name_value.setText("未查询")
+            self.usage_available_value.setText("--")
+            self.usage_granted_value.setText("--")
+            self.usage_used_value.setText("--")
+            self.usage_remaining_value.setText("--")
+            self.usage_unlimited_value.setText("否")
+            self.usage_expire_value.setText("不过期或未提供")
+            self.usage_limits_enabled_value.setText("未启用")
+            self.usage_model_limits_edit.setPlainText("未提供模型限制")
+            self.usage_error_value.setText(usage_error or fallback_text)
+            return
+
+        self.usage_name_value.setText(usage_snapshot.name or "未命名")
+        self.usage_available_value.setText(
+            format_quota_value(usage_snapshot.total_available)
+        )
+        self.usage_granted_value.setText(
+            format_quota_value(usage_snapshot.total_granted)
+        )
+        self.usage_used_value.setText(format_quota_value(usage_snapshot.total_used))
+        self.usage_remaining_value.setText(
+            format_quota_value(usage_snapshot.remaining_quota)
+        )
+        self.usage_unlimited_value.setText("是" if usage_snapshot.unlimited_quota else "否")
+        self.usage_expire_value.setText(format_expires_at(usage_snapshot.expires_at))
+        self.usage_limits_enabled_value.setText(
+            "已启用" if usage_snapshot.model_limits_enabled else "未启用"
+        )
+        self.usage_model_limits_edit.setPlainText(
+            format_model_limits(usage_snapshot.model_limits)
+        )
+        self.usage_error_value.setText(usage_error or "最近刷新成功")
+
     def get_values(self) -> tuple[str, str, GenerationSettings]:
         return (
-            self.api_url_edit.text().strip(),
-            self.api_key_edit.text().strip(),
+            self._api_base_url,
+            self._api_key,
         GenerationSettings(
             prompt="",
             model_type=self.model_edit.text().strip(),
@@ -376,13 +494,19 @@ class MainWindow(QMainWindow):
     def __init__(self, license_manager: LicenseManager | None = None) -> None:
         super().__init__()
         self.setWindowTitle(WINDOW_TITLE)
-        self.resize(1200, 800)
+        self.resize(1000, 800)
 
         self.license_manager = license_manager
         self.thread: QThread | None = None
         self.worker: BatchWorker | None = None
+        self.usage_thread: QThread | None = None
+        self.usage_worker: ApiUsageWorker | None = None
         self.slot_widgets: list[FolderSlotWidget] = []
         self.generation_settings = GenerationSettings()
+        self.usage_snapshot: ApiUsageSnapshot | None = None
+        self.usage_error = ""
+        self.usage_loading = False
+        self._usage_request_auto = False
 
         self._build_ui()
         self._apply_styles()
@@ -407,7 +531,7 @@ class MainWindow(QMainWindow):
 
         three_panel_layout = QHBoxLayout()
         three_panel_layout.setSpacing(14)
-        three_panel_layout.addWidget(self._build_slots_group(), 4)
+        three_panel_layout.addWidget(self._build_slots_group(), 3)
         three_panel_layout.addWidget(self._build_basic_config_group(), 3)
         three_panel_layout.addWidget(self._build_advanced_settings_group(), 2)
         root_layout.addLayout(three_panel_layout)
@@ -454,9 +578,8 @@ class MainWindow(QMainWindow):
         basic_form.setSpacing(10)
 
         self.api_url_edit = QLineEdit()
-        self.api_url_edit.setPlaceholderText(
-            "https://generativelanguage.googleapis.com"
-        )
+        self.api_url_edit.setText("https://wuaiapi.com")
+        self.api_url_edit.setEchoMode(QLineEdit.EchoMode.Password)
 
         self.api_key_edit = QLineEdit()
         self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -510,11 +633,8 @@ class MainWindow(QMainWindow):
         self.prompt_mode_combo.currentIndexChanged.connect(self.update_prompt_mode_ui)
         self.prompt_edit.textChanged.connect(self.update_task_summary)
         self.prompt_file_edit.textChanged.connect(self.update_task_summary)
-        self.api_url_edit.textChanged.connect(self.update_settings_summary)
-        self.api_key_edit.textChanged.connect(self.update_settings_summary)
-        self.prompt_mode_combo.currentIndexChanged.connect(self.update_settings_summary)
-        self.prompt_edit.textChanged.connect(self.update_settings_summary)
-        self.prompt_file_edit.textChanged.connect(self.update_settings_summary)
+        self.api_url_edit.editingFinished.connect(self.handle_usage_input_finished)
+        self.api_key_edit.editingFinished.connect(self.handle_usage_input_finished)
         self.update_prompt_mode_ui()
         return group
 
@@ -524,18 +644,64 @@ class MainWindow(QMainWindow):
         settings_layout.setContentsMargins(12, 12, 12, 12)
         settings_layout.setSpacing(12)
 
-        self.settings_summary_label = QLabel()
-        self.settings_summary_label.setWordWrap(True)
-        self.settings_summary_label.setObjectName("mutedLabel")
+        self.usage_card = QFrame()
+        self.usage_card.setObjectName("usageCard")
+        usage_layout = QVBoxLayout(self.usage_card)
+        usage_layout.setContentsMargins(14, 14, 14, 14)
+        usage_layout.setSpacing(8)
+
+        usage_header = QHBoxLayout()
+        usage_header.setSpacing(8)
+        usage_title = QLabel("API Key 额度")
+        usage_title.setObjectName("usageTitleLabel")
+        self.usage_state_badge = QLabel("未配置")
+        self.usage_state_badge.setObjectName("usageStateBadge")
+        usage_header.addWidget(usage_title)
+        usage_header.addStretch(1)
+        usage_header.addWidget(self.usage_state_badge)
+
+        self.usage_value_label = QLabel("--")
+        self.usage_value_label.setObjectName("usageValueLabel")
+        self.usage_meta_label = QLabel("请先填写 URL 和 API Key")
+        self.usage_meta_label.setWordWrap(True)
+        self.usage_meta_label.setObjectName("usageMetaLabel")
+
+        self.usage_progress_bar = QProgressBar()
+        self.usage_progress_bar.setTextVisible(False)
+        self.usage_progress_bar.setFixedHeight(10)
+        self.usage_progress_bar.hide()
+
+        self.usage_time_label = QLabel("最近刷新：未刷新")
+        self.usage_time_label.setObjectName("usageMetaLabel")
+        self.usage_error_label = QLabel("")
+        self.usage_error_label.setObjectName("usageErrorLabel")
+        self.usage_error_label.setWordWrap(True)
+        self.usage_error_label.hide()
+
+        self.usage_refresh_button = QPushButton("刷新额度")
+        self.usage_refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        usage_layout.addLayout(usage_header)
+        usage_layout.addWidget(self.usage_value_label)
+        usage_layout.addWidget(self.usage_meta_label)
+        usage_layout.addWidget(self.usage_progress_bar)
+        usage_layout.addWidget(self.usage_time_label)
+        usage_layout.addWidget(self.usage_error_label)
+        usage_layout.addWidget(
+            self.usage_refresh_button,
+            0,
+            Qt.AlignmentFlag.AlignLeft,
+        )
 
         self.settings_button = QPushButton("设置")
         self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        settings_layout.addWidget(self.settings_summary_label)
+        settings_layout.addWidget(self.usage_card)
         settings_layout.addStretch(1)
         settings_layout.addWidget(self.settings_button, 0, Qt.AlignmentFlag.AlignLeft)
 
         self.settings_button.clicked.connect(self.open_settings_dialog)
+        self.usage_refresh_button.clicked.connect(self.refresh_usage)
         return group
 
     def _build_action_group(self) -> QGroupBox:
@@ -625,6 +791,49 @@ class MainWindow(QMainWindow):
             #summaryLabel {
                 color: #7a5f14;
                 font-weight: 600;
+            }
+            #usageCard {
+                background: #fffcf6;
+                border: 1px solid #e7dfcf;
+                border-radius: 14px;
+            }
+            #usageTitleLabel {
+                font-size: 14px;
+                font-weight: 700;
+            }
+            #usageValueLabel {
+                font-size: 26px;
+                font-weight: 700;
+                color: #1f2937;
+            }
+            #usageMetaLabel {
+                color: #6b6253;
+            }
+            #usageErrorLabel {
+                color: #b45309;
+                font-weight: 600;
+            }
+            #usageStateBadge {
+                border-radius: 9px;
+                padding: 3px 10px;
+                font-size: 12px;
+                font-weight: 700;
+                color: #ffffff;
+            }
+            #usageStateBadge[usageState="inactive"] {
+                background: #a8a29e;
+            }
+            #usageStateBadge[usageState="loading"] {
+                background: #2563eb;
+            }
+            #usageStateBadge[usageState="success"] {
+                background: #15803d;
+            }
+            #usageStateBadge[usageState="warning"] {
+                background: #b45309;
+            }
+            #usageStateBadge[usageState="error"] {
+                background: #b91c1c;
             }
             #slotCard {
                 background: #ffffff;
@@ -756,7 +965,7 @@ class MainWindow(QMainWindow):
 
         if not self.slot_widgets:
             self.add_slot(FolderSlot(name="参考图"))
-        self.update_settings_summary()
+        self.refresh_usage(auto=True)
 
     def collect_config(self) -> AppConfig:
         settings = GenerationSettings(
@@ -781,44 +990,130 @@ class MainWindow(QMainWindow):
             generation_settings=settings,
         )
 
-    def update_settings_summary(self) -> None:
+    def handle_usage_input_finished(self) -> None:
+        self.refresh_usage(auto=True)
+
+    def refresh_usage(self, auto: bool = False) -> None:
+        base_url = self.api_url_edit.text().strip()
         api_key = self.api_key_edit.text().strip()
-        api_base_url = self.api_url_edit.text().strip()
 
-        masked_key = "未配置"
-        if api_key:
-            if len(api_key) <= 8:
-                masked_key = "*" * len(api_key)
+        if self.usage_thread is not None:
+            if not auto:
+                self.statusBar().showMessage("额度查询中，请稍候。", 3000)
+            return
+
+        self._usage_request_auto = auto
+        if not base_url or not api_key:
+            self.usage_snapshot = None
+            self.usage_loading = False
+            self.usage_error = "请先填写 URL 和 API Key。"
+            self.render_usage_state()
+            return
+
+        self.usage_loading = True
+        self.usage_error = ""
+        self.render_usage_state()
+
+        self.usage_thread = QThread(self)
+        self.usage_worker = ApiUsageWorker(base_url, api_key, timeout=10)
+        self.usage_worker.moveToThread(self.usage_thread)
+
+        self.usage_thread.started.connect(self.usage_worker.run)
+        self.usage_worker.usage_loaded.connect(self.apply_usage_snapshot)
+        self.usage_worker.usage_failed.connect(self.apply_usage_error)
+        self.usage_worker.finished.connect(self.usage_thread.quit)
+        self.usage_worker.finished.connect(self.usage_worker.deleteLater)
+        self.usage_thread.finished.connect(self.usage_thread.deleteLater)
+        self.usage_thread.finished.connect(self.handle_usage_worker_finished)
+        self.usage_thread.start()
+
+    def apply_usage_snapshot(self, snapshot: object) -> None:
+        self.usage_snapshot = snapshot if isinstance(snapshot, ApiUsageSnapshot) else None
+        self.usage_loading = False
+        self.usage_error = ""
+        self.render_usage_state()
+        self.statusBar().showMessage("额度信息已刷新。", 3000)
+
+    def apply_usage_error(self, message: str) -> None:
+        self.usage_loading = False
+        self.usage_error = message
+        self.render_usage_state()
+        if not self._usage_request_auto:
+            self.statusBar().showMessage(message, 4000)
+
+    def handle_usage_worker_finished(self) -> None:
+        self.usage_thread = None
+        self.usage_worker = None
+
+    def set_usage_badge(self, text: str, state: str) -> None:
+        self.usage_state_badge.setText(text)
+        self.usage_state_badge.setProperty("usageState", state)
+        self.usage_state_badge.style().unpolish(self.usage_state_badge)
+        self.usage_state_badge.style().polish(self.usage_state_badge)
+        self.usage_state_badge.update()
+
+    def render_usage_state(self) -> None:
+        snapshot = self.usage_snapshot
+        self.usage_refresh_button.setEnabled(not self.usage_loading)
+        self.usage_error_label.setVisible(bool(self.usage_error))
+        self.usage_error_label.setText(self.usage_error)
+
+        if self.usage_loading:
+            self.set_usage_badge("查询中", "loading")
+            self.usage_value_label.setText("额度查询中…")
+            self.usage_meta_label.setText("正在获取最新额度信息，请稍候。")
+            if snapshot is None:
+                self.usage_time_label.setText("最近刷新：未刷新")
+                self.usage_progress_bar.hide()
+            return
+
+        if snapshot is None:
+            if self.api_url_edit.text().strip() and self.api_key_edit.text().strip():
+                self.set_usage_badge("查询失败", "error")
+                self.usage_value_label.setText("--")
+                self.usage_meta_label.setText("暂未获取到额度数据。")
             else:
-                masked_key = f"{api_key[:4]}...{api_key[-4:]}"
+                self.set_usage_badge("未配置", "inactive")
+                self.usage_value_label.setText("--")
+                self.usage_meta_label.setText("请先填写 URL 和 API Key")
+            self.usage_time_label.setText("最近刷新：未刷新")
+            self.usage_progress_bar.hide()
+            return
 
-        settings = self.collect_config().generation_settings
-        prompt_mode_text = "提示词文本" if settings.prompt_mode == "file" else "固定提示词"
-        if settings.prompt_mode == "file":
-            prompt_source = settings.prompt_file_path or "未选择"
-        else:
-            prompt_source = f"{len(settings.prompt)} 字符" if settings.prompt else "未填写"
-        self.settings_summary_label.setText(
-            "URL：{url}\n"
-            "API Key：{key}\n"
-            "模型：{model}\n"
-            "Prompt：{prompt_mode}   来源：{prompt_source}\n"
-            "Temperature：{temperature:.2f}   Top P：{top_p:.2f}\n"
-            "比例：{ratio}   分辨率：{image_size}   超时：{timeout} 秒   每组：{variants} 次\n"
-            "Seed：{seed}".format(
-                url=api_base_url or "未配置",
-                key=masked_key,
-                model=settings.model_type or "未配置",
-                prompt_mode=prompt_mode_text,
-                prompt_source=prompt_source,
-                temperature=settings.temperature,
-                top_p=settings.top_p,
-                ratio=settings.aspect_ratio,
-                image_size=settings.image_size,
-                timeout=settings.timeout,
-                variants=settings.variants_per_group,
-                seed=str(settings.base_seed) if settings.seed_enabled else "随机",
+        if snapshot.unlimited_quota:
+            self.usage_value_label.setText("无限额度")
+            self.usage_meta_label.setText(
+                f"已使用 {format_quota_value(snapshot.total_used)}"
             )
+            self.usage_progress_bar.hide()
+        else:
+            self.usage_value_label.setText(
+                format_quota_value(snapshot.remaining_quota)
+            )
+            self.usage_meta_label.setText(
+                "已使用 {used} / 总授予 {granted}".format(
+                    used=format_quota_value(snapshot.total_used),
+                    granted=format_quota_value(snapshot.total_granted),
+                )
+            )
+            if snapshot.total_granted > 0:
+                progress_ratio = min(
+                    max(snapshot.total_used / snapshot.total_granted, 0.0),
+                    1.0,
+                )
+                self.usage_progress_bar.setRange(0, 1000)
+                self.usage_progress_bar.setValue(int(progress_ratio * 1000))
+                self.usage_progress_bar.show()
+            else:
+                self.usage_progress_bar.hide()
+
+        if self.usage_error:
+            self.set_usage_badge("刷新失败", "warning")
+        else:
+            self.set_usage_badge("已同步", "success")
+
+        self.usage_time_label.setText(
+            f"最近刷新：{format_fetched_at(snapshot.fetched_at)}"
         )
 
     def open_settings_dialog(self) -> None:
@@ -826,6 +1121,8 @@ class MainWindow(QMainWindow):
             api_base_url=self.api_url_edit.text().strip(),
             api_key=self.api_key_edit.text().strip(),
             generation_settings=self.generation_settings,
+            usage_snapshot=self.usage_snapshot,
+            usage_error=self.usage_error,
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -838,8 +1135,8 @@ class MainWindow(QMainWindow):
         self.api_url_edit.setText(api_base_url)
         self.api_key_edit.setText(api_key)
         self.generation_settings = generation_settings
-        self.update_settings_summary()
         self.update_task_summary()
+        self.refresh_usage(auto=True)
 
     def update_task_summary(self) -> None:
         enabled_slot_sources: list[tuple[str, dict[str, str]]] = []
