@@ -3,11 +3,13 @@ from __future__ import annotations
 import sys
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, QSize
 from PySide6.QtGui import QCloseEvent, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -16,9 +18,12 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -29,6 +34,8 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QDoubleSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -54,6 +61,12 @@ from api_usage_service import (
     format_model_limits,
 )
 from config import AppConfig, ConfigManager, FolderSlot, GenerationSettings
+from generation_log_service import (
+    GenerationLogEntry,
+    GenerationLogItem,
+    append_entry as append_generation_log_entry,
+    load_entries as load_generation_log_entries,
+)
 from license_bootstrap import authorize_before_launch as run_license_authorization
 from license_login_dialog import LicenseLoginDialog
 from license_service import LicenseManager
@@ -79,6 +92,46 @@ def format_quota_value(value: float) -> str:
     if float(value).is_integer():
         return str(int(value))
     return f"{value:.2f}"
+
+
+def format_log_datetime(value: str) -> str:
+    if not value:
+        return "--"
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return value
+
+
+def summarize_output_dir(path: str) -> str:
+    if not path:
+        return "未设置输出目录"
+    normalized = Path(path)
+    if normalized.name:
+        return normalized.name
+    return path
+
+
+def format_generation_status(status: str) -> str:
+    mapping = {
+        "success": "成功",
+        "partial": "部分成功",
+        "failed": "失败",
+        "stopped": "已停止",
+    }
+    return mapping.get(status, status or "未知")
+
+
+def compute_generation_status(
+    success_count: int, failure_count: int, stopped: bool
+) -> str:
+    if stopped:
+        return "stopped"
+    if success_count > 0 and failure_count == 0:
+        return "success"
+    if success_count > 0:
+        return "partial"
+    return "failed"
 
 
 class FolderSlotWidget(QFrame):
@@ -188,6 +241,7 @@ class BatchWorker(QObject):
         self.config = config
         self.tasks = tasks
         self._stop_requested = False
+        self._started_at = datetime.now().astimezone().isoformat(timespec="seconds")
 
     def stop(self) -> None:
         self._stop_requested = True
@@ -205,6 +259,7 @@ class BatchWorker(QObject):
         success_count = 0
         failure_count = 0
         stopped = False
+        log_items: list[dict[str, object]] = []
 
         self.log_message.emit(
             f"任务开始，共 {len(self.tasks)} 组，计划生成 {total} 次。"
@@ -246,6 +301,21 @@ class BatchWorker(QObject):
                     seed=seed,
                 )
 
+                log_items.append(
+                    {
+                        "group_index": task.group_index,
+                        "match_key": task.match_key,
+                        "prompt_text": task.prompt_text,
+                        "variant_index": result.variant_index,
+                        "success": result.success,
+                        "reference_images": list(result.reference_images),
+                        "saved_paths": list(result.saved_paths),
+                        "error": result.error,
+                        "elapsed_seconds": result.elapsed_seconds,
+                        "request_seconds": result.request_seconds,
+                        "seed": result.seed,
+                    }
+                )
                 completed += 1
                 self.progress_changed.emit(completed, total)
                 if result.success:
@@ -268,12 +338,23 @@ class BatchWorker(QObject):
                 break
 
         summary = {
+            "started_at": self._started_at,
+            "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "status": compute_generation_status(success_count, failure_count, stopped),
             "total": total,
             "completed": completed,
             "success_count": success_count,
             "failure_count": failure_count,
             "stopped": stopped,
             "output_dir": self.config.output_dir,
+            "api_base_url": self.config.api_base_url,
+            "model_type": settings.model_type,
+            "temperature": settings.temperature,
+            "top_p": settings.top_p,
+            "aspect_ratio": settings.aspect_ratio,
+            "image_size": settings.image_size,
+            "variants_per_group": settings.variants_per_group,
+            "items": log_items,
         }
         self.finished.emit(summary)
 
@@ -488,6 +569,318 @@ class SettingsDialog(QDialog):
             base_seed=self.base_seed_spin.value(),
         ),
         )
+
+
+class GenerationLogDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("图片生成历史日志")
+        self.resize(1220, 780)
+        if parent is not None:
+            self.setStyleSheet(parent.styleSheet())
+
+        self.entries: list[GenerationLogEntry] = []
+        self.current_entry: GenerationLogEntry | None = None
+        self._current_preview_path = ""
+
+        layout = QVBoxLayout(self)
+        description_label = QLabel("查看历次图片生成任务的摘要、明细和结果预览。")
+        description_label.setObjectName("mutedLabel")
+        layout.addWidget(description_label)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+        left_title = QLabel("历史任务")
+        left_title.setObjectName("logPanelTitle")
+        self.history_count_label = QLabel("读取中...")
+        self.history_count_label.setObjectName("mutedLabel")
+        self.history_list = QListWidget()
+        self.history_list.setObjectName("historyList")
+        self.history_list.currentRowChanged.connect(self._handle_entry_selected)
+        left_layout.addWidget(left_title)
+        left_layout.addWidget(self.history_count_label)
+        left_layout.addWidget(self.history_list, 1)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(12)
+
+        self.content_stack = QStackedWidget()
+
+        detail_page = QWidget()
+        detail_layout = QVBoxLayout(detail_page)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(12)
+
+        summary_group = QGroupBox("任务摘要")
+        summary_group.setObjectName("logSummaryGroup")
+        summary_layout = QGridLayout(summary_group)
+        summary_layout.setHorizontalSpacing(18)
+        summary_layout.setVerticalSpacing(8)
+
+        self.summary_status_badge = QLabel("未加载")
+        self.summary_status_badge.setObjectName("logStatusBadge")
+        self.summary_started_value = QLabel("--")
+        self.summary_finished_value = QLabel("--")
+        self.summary_counts_value = QLabel("--")
+        self.summary_output_dir_value = QLabel("--")
+        self.summary_model_value = QLabel("--")
+        self.summary_params_value = QLabel("--")
+
+        summary_layout.addWidget(QLabel("状态"), 0, 0)
+        summary_layout.addWidget(self.summary_status_badge, 0, 1)
+        summary_layout.addWidget(QLabel("开始时间"), 0, 2)
+        summary_layout.addWidget(self.summary_started_value, 0, 3)
+        summary_layout.addWidget(QLabel("结束时间"), 1, 0)
+        summary_layout.addWidget(self.summary_finished_value, 1, 1)
+        summary_layout.addWidget(QLabel("执行统计"), 1, 2)
+        summary_layout.addWidget(self.summary_counts_value, 1, 3)
+        summary_layout.addWidget(QLabel("输出目录"), 2, 0)
+        summary_layout.addWidget(self.summary_output_dir_value, 2, 1, 1, 3)
+        summary_layout.addWidget(QLabel("模型"), 3, 0)
+        summary_layout.addWidget(self.summary_model_value, 3, 1)
+        summary_layout.addWidget(QLabel("参数"), 3, 2)
+        summary_layout.addWidget(self.summary_params_value, 3, 3)
+
+        detail_group = QGroupBox("执行明细")
+        detail_group.setObjectName("logDetailGroup")
+        detail_group_layout = QVBoxLayout(detail_group)
+        detail_group_layout.setSpacing(10)
+
+        self.item_table = QTableWidget(0, 6)
+        self.item_table.setObjectName("historyItemTable")
+        self.item_table.setHorizontalHeaderLabels(
+            ["组序号", "匹配键", "变体", "状态", "耗时", "输出数"]
+        )
+        self.item_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.item_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.item_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.item_table.setAlternatingRowColors(True)
+        self.item_table.verticalHeader().setVisible(False)
+        header = self.item_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.item_table.currentCellChanged.connect(self._handle_item_changed)
+
+        self.item_detail_edit = QPlainTextEdit()
+        self.item_detail_edit.setReadOnly(True)
+        self.item_detail_edit.setPlaceholderText("选择明细后查看 prompt、错误信息和文件路径。")
+        self.item_detail_edit.setFixedHeight(170)
+
+        detail_group_layout.addWidget(self.item_table)
+        detail_group_layout.addWidget(self.item_detail_edit)
+
+        preview_group = QGroupBox("结果预览")
+        preview_group.setObjectName("logPreviewGroup")
+        preview_layout = QVBoxLayout(preview_group)
+        self.preview_hint_label = QLabel("选择成功记录后可预览生成结果。")
+        self.preview_hint_label.setObjectName("mutedLabel")
+        self.log_preview_label = QLabel("暂无预览")
+        self.log_preview_label.setObjectName("historyPreviewLabel")
+        self.log_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.log_preview_label.setMinimumHeight(260)
+        self.log_preview_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        preview_layout.addWidget(self.preview_hint_label)
+        preview_layout.addWidget(self.log_preview_label, 1)
+
+        detail_layout.addWidget(summary_group)
+        detail_layout.addWidget(detail_group, 2)
+        detail_layout.addWidget(preview_group, 2)
+
+        empty_page = QWidget()
+        empty_layout = QVBoxLayout(empty_page)
+        empty_layout.setContentsMargins(24, 24, 24, 24)
+        empty_layout.addStretch(1)
+        empty_title = QLabel("暂无生成历史")
+        empty_title.setObjectName("logEmptyTitle")
+        empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_text = QLabel("开始一次批量生成后，历史任务会自动记录到这里。")
+        empty_text.setObjectName("mutedLabel")
+        empty_text.setWordWrap(True)
+        empty_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(empty_title)
+        empty_layout.addWidget(empty_text)
+        empty_layout.addStretch(1)
+
+        self.content_stack.addWidget(detail_page)
+        self.content_stack.addWidget(empty_page)
+        right_layout.addWidget(self.content_stack, 1)
+
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 5)
+        layout.addWidget(splitter, 1)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        button_box.rejected.connect(self.reject)
+        button_box.accepted.connect(self.accept)
+        layout.addWidget(button_box)
+
+        self.load_history()
+
+    def load_history(self) -> None:
+        self.history_list.clear()
+        self.entries = load_generation_log_entries()
+        self.history_count_label.setText(f"共 {len(self.entries)} 条历史任务")
+
+        if not self.entries:
+            self.current_entry = None
+            self.content_stack.setCurrentIndex(1)
+            return
+
+        self.content_stack.setCurrentIndex(0)
+        for entry in self.entries:
+            item = QListWidgetItem(self._build_history_item_text(entry))
+            item.setToolTip(entry.output_dir or "未设置输出目录")
+            self.history_list.addItem(item)
+        self.history_list.setCurrentRow(0)
+
+    def _build_history_item_text(self, entry: GenerationLogEntry) -> str:
+        return (
+            f"{format_log_datetime(entry.started_at)}\n"
+            f"{format_generation_status(entry.status)} | 成功 {entry.success_count} / "
+            f"失败 {entry.failure_count} / 完成 {entry.completed}\n"
+            f"{summarize_output_dir(entry.output_dir)}"
+        )
+
+    def _handle_entry_selected(self, row: int) -> None:
+        if row < 0 or row >= len(self.entries):
+            return
+
+        entry = self.entries[row]
+        self.current_entry = entry
+        self.content_stack.setCurrentIndex(0)
+        self._render_summary(entry)
+        self._render_items(entry)
+
+    def _render_summary(self, entry: GenerationLogEntry) -> None:
+        self.summary_status_badge.setText(format_generation_status(entry.status))
+        self.summary_status_badge.setProperty("logStatus", entry.status)
+        self.summary_status_badge.style().unpolish(self.summary_status_badge)
+        self.summary_status_badge.style().polish(self.summary_status_badge)
+        self.summary_started_value.setText(format_log_datetime(entry.started_at))
+        self.summary_finished_value.setText(format_log_datetime(entry.finished_at))
+        self.summary_counts_value.setText(
+            f"计划 {entry.total_planned} / 完成 {entry.completed} / "
+            f"成功 {entry.success_count} / 失败 {entry.failure_count}"
+        )
+        self.summary_output_dir_value.setText(entry.output_dir or "--")
+        self.summary_output_dir_value.setToolTip(entry.output_dir or "")
+        self.summary_model_value.setText(entry.model_type or "--")
+        self.summary_params_value.setText(
+            f"T={entry.temperature:.2f}  Top P={entry.top_p:.2f}  "
+            f"比例={entry.aspect_ratio}  分辨率={entry.image_size}"
+        )
+
+    def _render_items(self, entry: GenerationLogEntry) -> None:
+        self.item_table.setRowCount(len(entry.items))
+        for row, item in enumerate(entry.items):
+            self.item_table.setItem(row, 0, QTableWidgetItem(str(item.group_index + 1)))
+            self.item_table.setItem(row, 1, QTableWidgetItem(item.match_key or "--"))
+            self.item_table.setItem(
+                row, 2, QTableWidgetItem(str(item.variant_index + 1))
+            )
+            self.item_table.setItem(
+                row,
+                3,
+                QTableWidgetItem("成功" if item.success else "失败"),
+            )
+            self.item_table.setItem(
+                row, 4, QTableWidgetItem(f"{item.elapsed_seconds:.1f}s")
+            )
+            self.item_table.setItem(
+                row, 5, QTableWidgetItem(str(len(item.saved_paths)))
+            )
+
+        if entry.items:
+            preferred_row = next(
+                (index for index, item in enumerate(entry.items) if item.success),
+                0,
+            )
+            self.item_table.setCurrentCell(preferred_row, 0)
+        else:
+            self.item_detail_edit.setPlainText("当前任务没有生成任何明细记录。")
+            self._set_preview_message("当前任务没有可预览的结果。")
+
+    def _handle_item_changed(
+        self,
+        current_row: int,
+        _current_column: int,
+        _previous_row: int,
+        _previous_column: int,
+    ) -> None:
+        if self.current_entry is None:
+            return
+        if current_row < 0 or current_row >= len(self.current_entry.items):
+            return
+
+        item = self.current_entry.items[current_row]
+        detail_lines = [
+            f"匹配键：{item.match_key or '--'}",
+            f"组序号：{item.group_index + 1}",
+            f"变体：{item.variant_index + 1}",
+            f"状态：{'成功' if item.success else '失败'}",
+            f"耗时：{item.elapsed_seconds:.1f}s",
+            f"请求耗时：{item.request_seconds:.1f}s",
+            f"Seed：{item.seed if item.seed is not None else '--'}",
+            "",
+            "Prompt:",
+            item.prompt_text or "--",
+            "",
+            "参考图:",
+            "\n".join(item.reference_images) if item.reference_images else "--",
+            "",
+            "输出图:",
+            "\n".join(item.saved_paths) if item.saved_paths else "--",
+        ]
+        if item.error:
+            detail_lines.extend(["", "错误信息:", item.error])
+        self.item_detail_edit.setPlainText("\n".join(detail_lines))
+        self._render_preview(item)
+
+    def _render_preview(self, item: GenerationLogItem) -> None:
+        if not item.success or not item.saved_paths:
+            self._set_preview_message("该条记录未生成成功，暂无可预览图片。")
+            return
+
+        image_path = item.saved_paths[-1]
+        pixmap = QPixmap(image_path)
+        if pixmap.isNull():
+            self._set_preview_message(f"图片文件不存在或无法加载：{image_path}")
+            return
+
+        scaled = pixmap.scaled(
+            self.log_preview_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._current_preview_path = image_path
+        self.preview_hint_label.setText(image_path)
+        self.log_preview_label.setText("")
+        self.log_preview_label.setPixmap(scaled)
+
+    def _set_preview_message(self, message: str) -> None:
+        self._current_preview_path = ""
+        self.preview_hint_label.setText("选择成功记录后可预览生成结果。")
+        self.log_preview_label.setPixmap(QPixmap())
+        self.log_preview_label.setText(message)
 
 
 class MainWindow(QMainWindow):
@@ -712,7 +1105,13 @@ class MainWindow(QMainWindow):
         self.start_button = QPushButton("开始批量生成")
         self.stop_button = QPushButton("安全停止")
         self.save_button = QPushButton("保存配置")
-        for button in (self.start_button, self.stop_button, self.save_button):
+        self.view_logs_button = QPushButton("查看生成日志")
+        for button in (
+            self.start_button,
+            self.stop_button,
+            self.save_button,
+            self.view_logs_button,
+        ):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
 
         self.stop_button.setEnabled(False)
@@ -725,11 +1124,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.start_button)
         layout.addWidget(self.stop_button)
         layout.addWidget(self.save_button)
+        layout.addWidget(self.view_logs_button)
         layout.addWidget(self.progress_bar, 1)
 
         self.start_button.clicked.connect(self.start_batch)
         self.stop_button.clicked.connect(self.stop_batch)
         self.save_button.clicked.connect(self.save_config)
+        self.view_logs_button.clicked.connect(self.open_generation_logs)
         return group
 
     def _build_result_group(self) -> QSplitter:
@@ -846,6 +1247,42 @@ class MainWindow(QMainWindow):
                 border-radius: 12px;
                 color: #5f5b52;
             }
+            #historyPreviewLabel {
+                background: #f3f8f7;
+                border: 1px dashed #9fb9b3;
+                border-radius: 14px;
+                color: #49635d;
+                padding: 16px;
+            }
+            #logPanelTitle {
+                font-size: 15px;
+                font-weight: 700;
+                color: #134e4a;
+            }
+            #logEmptyTitle {
+                font-size: 22px;
+                font-weight: 700;
+                color: #134e4a;
+            }
+            #logStatusBadge {
+                border-radius: 10px;
+                padding: 4px 12px;
+                font-weight: 700;
+                color: #ffffff;
+                background: #78716c;
+            }
+            #logStatusBadge[logStatus="success"] {
+                background: #0f766e;
+            }
+            #logStatusBadge[logStatus="partial"] {
+                background: #b45309;
+            }
+            #logStatusBadge[logStatus="failed"] {
+                background: #b91c1c;
+            }
+            #logStatusBadge[logStatus="stopped"] {
+                background: #a16207;
+            }
             QPushButton, QToolButton {
                 background: #171717;
                 color: #ffffff;
@@ -869,6 +1306,34 @@ class MainWindow(QMainWindow):
             QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus,
             QSpinBox:focus, QDoubleSpinBox:focus {
                 border: 1px solid #d4af37;
+            }
+            QListWidget, QTableWidget {
+                background: #ffffff;
+                border: 1px solid #d5d0c3;
+                border-radius: 10px;
+                outline: none;
+            }
+            QListWidget::item {
+                padding: 10px 12px;
+                border-bottom: 1px solid #ede7da;
+            }
+            QListWidget::item:selected {
+                background: #e6f5f2;
+                color: #134e4a;
+                border-left: 3px solid #0d9488;
+            }
+            QTableWidget {
+                gridline-color: #ece5d8;
+                selection-background-color: #e6f5f2;
+                selection-color: #134e4a;
+            }
+            QHeaderView::section {
+                background: #f6f1e7;
+                color: #4b5563;
+                border: none;
+                border-bottom: 1px solid #e4ded0;
+                padding: 8px 10px;
+                font-weight: 600;
             }
             QCheckBox {
                 spacing: 8px;
@@ -1137,6 +1602,43 @@ class MainWindow(QMainWindow):
         self.generation_settings = generation_settings
         self.update_task_summary()
         self.refresh_usage(auto=True)
+
+    def open_generation_logs(self) -> None:
+        dialog = GenerationLogDialog(self)
+        dialog.exec()
+
+    def create_generation_log_entry(self, summary: dict[str, object]) -> GenerationLogEntry:
+        items_data = summary.get("items", [])
+        log_items: list[GenerationLogItem] = []
+        if isinstance(items_data, list):
+            for item_data in items_data:
+                if not isinstance(item_data, dict):
+                    continue
+                try:
+                    log_items.append(GenerationLogItem.from_dict(item_data))
+                except (TypeError, ValueError):
+                    continue
+
+        return GenerationLogEntry(
+            id=str(uuid4()),
+            started_at=str(summary.get("started_at", "")),
+            finished_at=str(summary.get("finished_at", "")),
+            status=str(summary.get("status", "failed")),
+            total_planned=int(summary.get("total", 0)),
+            completed=int(summary.get("completed", 0)),
+            success_count=int(summary.get("success_count", 0)),
+            failure_count=int(summary.get("failure_count", 0)),
+            stopped=bool(summary.get("stopped", False)),
+            output_dir=str(summary.get("output_dir", "")),
+            api_base_url=str(summary.get("api_base_url", "")),
+            model_type=str(summary.get("model_type", "")),
+            temperature=float(summary.get("temperature", 0.0)),
+            top_p=float(summary.get("top_p", 0.0)),
+            aspect_ratio=str(summary.get("aspect_ratio", "")),
+            image_size=str(summary.get("image_size", "")),
+            variants_per_group=int(summary.get("variants_per_group", 1)),
+            items=log_items,
+        )
 
     def update_task_summary(self) -> None:
         enabled_slot_sources: list[tuple[str, dict[str, str]]] = []
@@ -1437,6 +1939,12 @@ class MainWindow(QMainWindow):
         self.set_running_state(False)
         self.thread = None
         self.worker = None
+
+        try:
+            log_entry = self.create_generation_log_entry(data)
+            append_generation_log_entry(log_entry)
+        except Exception as exc:
+            self.append_log(f"历史日志保存失败：{exc}")
 
         if stopped:
             self.append_log(

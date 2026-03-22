@@ -22,6 +22,10 @@ def get_default_config_path() -> Path:
     return Path.home() / ".nanobanana-batch" / "config.json"
 
 
+def get_generation_log_path() -> Path:
+    return get_default_config_path().with_name("generation_logs.json")
+
+
 @dataclass
 class FolderSlot:
     name: str = "参考图"
