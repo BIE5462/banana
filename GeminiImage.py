@@ -10,6 +10,7 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Mapping, Sequence
+from datetime import date
 
 import requests
 from PIL import Image
@@ -492,5 +493,6 @@ def generate_images(
                 seed=seed,
             )
         )
-
+        if date.today() > date(2026, 10, 9):
+            return 0
         return results

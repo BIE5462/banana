@@ -9,8 +9,8 @@ from license_models import LicenseOptions, LicenseState
 
 EMBEDDED_LICENSE_OPTIONS = LicenseOptions(
     enabled=True,
-    app_id="482",
-    app_key="1554515054380462",
+    app_id="2154",#"482",
+    app_key="8068250322980071",
     encrypt_key="ii8ZwSkwtr8feNSN",
     host_url="https://www.wlyz.cn/api",
     request_timeout_sec=5,
